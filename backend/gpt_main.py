@@ -12,7 +12,14 @@ import logging
 from datetime import datetime
 import uuid
 import torch
-from transformers import Qwen2_5OmniForConditionalGeneration, Qwen2_5OmniProcessor
+from modeling_qwen2_5_omni_low_VRAM_mode import Qwen2_5OmniForConditionalGeneration
+from transformers import Qwen2_5OmniProcessor
+from transformers.utils.hub import cached_file
+from gptqmodel import GPTQModel
+from gptqmodel.models.base import BaseGPTQModel
+from gptqmodel.models.auto import MODEL_MAP
+from gptqmodel.models._const import CPU, SUPPORTED_MODELS
+from huggingface_hub import snapshot_download
 from qwen_omni_utils import process_mm_info
 import librosa
 import tempfile
@@ -21,34 +28,124 @@ import threading
 from concurrent.futures import ThreadPoolExecutor
 import functools
 
-# Qwen Omni integration
+# GPTQ Model Class for Qwen2.5-Omni
+class Qwen25OmniThinkerGPTQ(BaseGPTQModel):
+    loader = Qwen2_5OmniForConditionalGeneration
+    base_modules = [
+        "thinker.model.embed_tokens", 
+        "thinker.model.norm", 
+        "token2wav", 
+        "thinker.audio_tower", 
+        "thinker.model.rotary_emb",
+        "thinker.visual", 
+        "talker"
+    ]
+    pre_lm_head_norm_module = "thinker.model.norm"
+    require_monkeypatch = False
+    layers_node = "thinker.model.layers"
+    layer_type = "Qwen2_5OmniDecoderLayer"
+    layer_modules = [
+        ["self_attn.k_proj", "self_attn.v_proj", "self_attn.q_proj"],
+        ["self_attn.o_proj"],
+        ["mlp.up_proj", "mlp.gate_proj"],
+        ["mlp.down_proj"],
+    ]
+   
+    def pre_quantize_generate_hook_start(self):
+        from gptqmodel.models._const import CPU
+        self.thinker.visual = self._move_to(self.thinker.visual, device=self.quantize_config.device)
+        self.thinker.audio_tower = self._move_to(self.thinker.audio_tower, device=self.quantize_config.device)
+
+    def pre_quantize_generate_hook_end(self):
+        from gptqmodel.models._const import CPU
+        self.thinker.visual = self._move_to(self.thinker.visual, device=CPU)
+        self.thinker.audio_tower = self._move_to(self.thinker.audio_tower, device=CPU)
+
+    def _move_to(self, module, device):
+        """Helper function to move module to device"""
+        if hasattr(module, 'to'):
+            return module.to(device)
+        return module
+
+    def preprocess_dataset(self, sample: Dict) -> Dict:
+        return sample
+
+# Register the GPTQ model
+MODEL_MAP["qwen2_5_omni"] = Qwen25OmniThinkerGPTQ
+SUPPORTED_MODELS.extend(["qwen2_5_omni"])
+
+@classmethod
+def patched_from_config(cls, config, *args, **kwargs):
+    kwargs.pop("trust_remote_code", None)
+    model = cls._from_config(config, **kwargs)
+    
+    # Load speaker dictionary
+    try:
+        spk_path = cached_file(
+            kwargs.get('model_path', 'Qwen/Qwen2.5-Omni-7B-GPTQ-Int4'),
+            "spk_dict.pt",
+            subfolder=kwargs.pop("subfolder", None),
+            cache_dir=kwargs.pop("cache_dir", None),
+            force_download=kwargs.pop("force_download", False),
+            proxies=kwargs.pop("proxies", None),
+            resume_download=kwargs.pop("resume_download", None),
+            local_files_only=kwargs.pop("local_files_only", False),
+            token=kwargs.pop("use_auth_token", None),
+            revision=kwargs.pop("revision", None),
+        )
+        if spk_path and hasattr(model, 'load_speakers'):
+            model.load_speakers(spk_path)
+    except Exception as e:
+        logger.warning(f"Could not load speaker dictionary: {e}")
+    
+    return model
+
+# Patch the from_config method
+Qwen2_5OmniForConditionalGeneration.from_config = patched_from_config
+
+# Qwen Omni integration with GPTQ
 class QwenOmniClient:
-    def __init__(self, model_path="Qwen/Qwen2.5-Omni-7B"):
+    def __init__(self, model_path="Qwen/Qwen2.5-Omni-7B-GPTQ-Int4"):
         self.model_path = model_path
         self.model = None
         self.processor = None
+        self.device_map = {
+            "thinker.model": "cuda" if torch.cuda.is_available() else "cpu", 
+            "thinker.lm_head": "cuda" if torch.cuda.is_available() else "cpu", 
+            "thinker.visual": "cpu",  # Keep visual on CPU to save VRAM
+            "thinker.audio_tower": "cpu",  # Keep audio on CPU to save VRAM
+            "talker": "cuda" if torch.cuda.is_available() else "cpu",  
+            "token2wav": "cuda" if torch.cuda.is_available() else "cpu",  
+        }
         self._initialize_model()
         
     def _initialize_model(self):
-        """Initialize the Qwen Omni model and processor"""
+        """Initialize the Qwen Omni GPTQ model and processor"""
         try:
-            logger.info("Loading Qwen Omni model...")
-            self.model = Qwen2_5OmniForConditionalGeneration.from_pretrained(
-                self.model_path,
-                torch_dtype=torch.bfloat16,
-                attn_implementation="eager"
-            )
-            self.processor = Qwen2_5OmniProcessor.from_pretrained(self.model_path)
+            logger.info("Downloading and loading Qwen Omni GPTQ model...")
             
-            # Move model to GPU if available
+            # Download model if needed
+            model_path = snapshot_download(repo_id=self.model_path)
+            
+            # Load GPTQ model with optimized device mapping
+            self.model = GPTQModel.load(
+                model_path, 
+                device_map=self.device_map, 
+                torch_dtype=torch.float16,   
+                attn_implementation="flash_attention_2" if torch.cuda.is_available() else "eager"
+            )
+            
+            # Load processor
+            self.processor = Qwen2_5OmniProcessor.from_pretrained(model_path)
+            
             if torch.cuda.is_available():
-                self.model = self.model.cuda()
-                logger.info("Model loaded on GPU")
+                logger.info("GPTQ Model loaded with optimized GPU/CPU split")
+                logger.info(f"Device map: {self.device_map}")
             else:
-                logger.info("Model loaded on CPU")
+                logger.info("GPTQ Model loaded on CPU")
                 
         except Exception as e:
-            logger.error(f"Error loading Qwen Omni model: {e}")
+            logger.error(f"Error loading Qwen Omni GPTQ model: {e}")
             raise e
     
     def _save_audio_to_temp_file(self, audio_data: bytes) -> str:
@@ -137,7 +234,7 @@ class QwenOmniClient:
     
     def _run_inference(self, messages: List[Dict], audio_array: np.ndarray = None) -> str:
         """
-        Run inference with the Qwen Omni model
+        Run inference with the Qwen Omni GPTQ model
         """
         try:
             # Apply chat template
@@ -165,20 +262,22 @@ class QwenOmniClient:
                 use_audio_in_video=True
             )
             
-            # Move inputs to model device
-            inputs = inputs.to(self.model.device).to(self.model.dtype)
+            # Move inputs to appropriate device (CUDA if available)
+            device = 'cuda' if torch.cuda.is_available() else 'cpu'
+            inputs = inputs.to(device).to(self.model.dtype)
             
-            # Generate response
+            # Generate response with GPTQ model
             with torch.no_grad():
                 output = self.model.generate(
                     **inputs, 
                     use_audio_in_video=True, 
-                    return_audio=False, 
+                    return_audio=False,  # Disable audio return for now to save memory
                     thinker_max_new_tokens=256, 
                     thinker_do_sample=False,
                     max_new_tokens=512,
                     do_sample=True,
-                    temperature=0.7
+                    temperature=0.7,
+                    pad_token_id=self.processor.tokenizer.eos_token_id
                 )
             
             # Decode output
@@ -198,11 +297,30 @@ class QwenOmniClient:
                 return assistant_response.strip()
             else:
                 # Fallback: return the last part after the last user message
-                return full_response.split("user\n")[-1].strip()
+                parts = full_response.split("user\n")
+                if len(parts) > 1:
+                    return parts[-1].strip()
+                return full_response.strip()
             
         except Exception as e:
             logger.error(f"Error in _run_inference: {e}")
             raise e
+    
+    def get_memory_usage(self):
+        """Get current GPU memory usage"""
+        if torch.cuda.is_available():
+            return {
+                "allocated": torch.cuda.memory_allocated() / 1024 / 1024,  # MB
+                "reserved": torch.cuda.memory_reserved() / 1024 / 1024,    # MB
+                "max_allocated": torch.cuda.max_memory_allocated() / 1024 / 1024  # MB
+            }
+        return {"message": "CUDA not available"}
+    
+    def clear_memory_cache(self):
+        """Clear GPU memory cache"""
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+            torch.cuda.reset_peak_memory_stats()
 
 # Initialize Flask app
 app = Flask(__name__)
@@ -302,6 +420,21 @@ def clear_conversation_history(client_id):
         manager.conversation_history[client_id] = []
         return jsonify({"message": "Conversation history cleared"})
     return jsonify({"message": "Client not found"})
+
+@app.route('/memory')
+def get_memory_usage():
+    """Get current GPU memory usage"""
+    if qwen_client:
+        return jsonify(qwen_client.get_memory_usage())
+    return jsonify({"error": "Model not loaded"})
+
+@app.route('/memory/clear', methods=['POST'])
+def clear_memory_cache():
+    """Clear GPU memory cache"""
+    if qwen_client:
+        qwen_client.clear_memory_cache()
+        return jsonify({"message": "Memory cache cleared", "usage": qwen_client.get_memory_usage()})
+    return jsonify({"error": "Model not loaded"})
 
 # SocketIO Events
 @socketio.on('connect')
